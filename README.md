@@ -16,31 +16,31 @@ See `FPGA_Implementation_Roadmap.md` for the full phase-by-phase log.
 
 ```mermaid
 flowchart TB
-    subgraph HPS["HPS (ARM Cortex-A9, embedded Linux)"]
-        driver["Userspace test driver\n(mmap /dev/mem, sw/hps_driver/*.c)\nplays the CXL host + BI responder"]
+    subgraph HPS["HPS: ARM Cortex-A9, embedded Linux"]
+        driver["Userspace test driver<br/>mmap /dev/mem, sw/hps_driver/*.c<br/>plays the CXL host plus BI responder"]
     end
 
     subgraph Bridge["Lightweight HPS-to-FPGA bridge"]
-        avalon["Avalon-MM\n(word-addressed, 5-bit address, 17 registers)"]
+        avalon["Avalon-MM<br/>word-addressed, 5-bit address, 17 registers"]
     end
 
-    subgraph FPGA["FPGA fabric (Cyclone V)"]
-        shim["cxl_avalon_shim.sv\nregister-poke <-> valid/ready translation\none-deep pending-request holding register (BUG-006 fix)"]
-        engine["cxl_mem_protocol_engine.sv\nM2S/S2M tag-indexed transaction tracking\nBI sequencer FSM · eviction-writeback FSM\ncache bypass mux"]
-        bias["cxl_bias_table.sv\nper-line Host-Biased / Device-Biased\nsynchronous reset (BUG-009 fix)"]
-        cache["Cache tag/data arrays\ndirect-mapped, write-back + write-allocate\n16 lines (CACHE_IDX_W=4)"]
-        mem["Backing memory\non-chip array, 256 words (ADDR_W=8)"]
+    subgraph FPGA["FPGA fabric: Cyclone V"]
+        shim["cxl_avalon_shim.sv<br/>register-poke to valid/ready translation<br/>one-deep pending-request holding register, BUG-006 fix"]
+        engine["cxl_mem_protocol_engine.sv<br/>M2S/S2M tag-indexed transaction tracking<br/>BI sequencer FSM, eviction-writeback FSM<br/>cache bypass mux"]
+        bias["cxl_bias_table.sv<br/>per-line Host-Biased or Device-Biased<br/>synchronous reset, BUG-009 fix"]
+        cache["Cache tag/data arrays<br/>direct-mapped, write-back plus write-allocate<br/>16 lines, CACHE_IDX_W=4"]
+        mem["Backing memory<br/>on-chip array, 256 words, ADDR_W=8"]
     end
 
-    driver <-->|mmap'd register reads/writes\n0xFF200000 + 0x6000| avalon
+    driver <-->|"mmap register reads/writes at 0xFF206000"| avalon
     avalon <--> shim
-    shim -->|m2s_valid/ready, tag, addr, wdata| engine
-    engine -->|s2m_valid/ready, tag, is_data, rdata| shim
+    shim -->|"m2s_valid/ready, tag, addr, wdata"| engine
+    engine -->|"s2m_valid/ready, tag, is_data, rdata"| shim
     engine <--> bias
     engine <--> cache
     engine <--> mem
-    engine -.->|bi_req_valid/addr| driver
-    driver -.->|bi_req_ready, bi_rsp_valid\n(host-side BI responder)| engine
+    engine -.->|"bi_req_valid/addr"| driver
+    driver -.->|"bi_req_ready, bi_rsp_valid: host-side BI responder"| engine
 ```
 
 Every arrow above is a real, currently-passing test, not an aspirational diagram — see
@@ -86,6 +86,96 @@ sequence, scoped down to two parties instead of N.
   `COVERAGE_REPORT.md` — see that file for why), `sim/phase4h`, and on real hardware via
   `sw/hps_driver/host_driver_linux_phase234h.c`, where the driver itself plays the
   host-side BI responder.
+
+---
+
+## Results at a glance
+
+Every number below is pulled directly from a report file or a real hardware run — not
+estimated. Sources are named so they can be checked against the repo.
+
+### Timing closure (`quartus/output_files/CXL_DE10_Standard.sta.summary`, final build)
+
+Worst-corner (Slow 1100mV 85°C model), the design's own clock domain:
+
+| | Setup slack | Hold slack | TNS |
+|---|---|---|---|
+| `CLOCK_50` | **6.582 ns** | **0.280 ns** | 0.000 |
+
+**No negative slack anywhere in the design**, across every corner and domain `quartus_sta`
+checked (Slow/Fast × 1100mV × 0°C/85°C, all clock domains) — checked directly, not assumed.
+`CLOCK_50` setup slack shrank across the project as combinational depth grew, always staying
+comfortably positive: **9.096 ns** (pre-cache, Phase 2H/3H/4H build) → **6.588 ns** (post-cache,
+Phase 5H/6H build) → **6.582 ns** (final, post-bypass-mux, Phase 8 build).
+
+### FPGA resource utilization (`quartus/output_files/CXL_DE10_Standard.fit.summary`, final build)
+
+| Resource | Used | Available | % |
+|---|---|---|---|
+| Logic (ALMs) | 8,189 | 41,910 | 20% |
+| Registers | 14,151 | — | — |
+| Pins | 338 | 499 | 68% |
+| Block memory bits | 2,816 | 5,662,720 | <1% |
+| RAM blocks (M10K) | 6 | 553 | 1% |
+| DSP blocks | 0 | 112 | 0% |
+| PLLs | 0 | 15 | 0% |
+| DLLs | 1 | 4 | 25% |
+
+Whole `soc_system` (HPS bridge infrastructure included) plus the CXL-Lite logic together —
+this project's own RTL (`cxl_avalon_shim`, `cxl_mem_protocol_engine`, `cxl_bias_table`) is a
+small fraction of the 20% ALM figure; the HPS SDRAM controller and bridge fabric account for
+most of it. Zero DSP blocks used — this design is pure control/FSM/mux logic and array
+lookups, no arithmetic datapath, consistent with the timing-closure audit in
+`FPGA_Implementation_Roadmap.md` finding nothing worth pipelining.
+
+### Sim coverage (`COVERAGE_REPORT.md`)
+
+**90/150 (60.00%)** Verilator line/toggle coverage, merged across all 7 engine-level
+testbenches. The more meaningful number is the hand-curated functional cross-coverage table
+in that file — every `access_type × bias_state_before × bias_state_after` and
+`cache_result × bias_state` cell mapped to a specific named test, which is how a real gap
+(write-triggered BI had never been tested) was found and fixed, not just a percentage.
+
+### Cache correctness — hardware-measured hit/miss counters
+
+Not simulated: these are the actual `CACHE_HITS`/`CACHE_MISSES` register values read back
+over the Avalon bridge during real hardware test runs.
+
+| Test | `hits` | `misses` | Source |
+|---|---|---|---|
+| Phase 5H/6H full run (allocate/hit/evict/thrash) | +2 | +13 | `host_driver_linux_phase56h.c` |
+| Phase 7 Stress 3: 24-line working set vs. 16-line cache | +8 | +40 | `host_driver_linux_phase7.c` |
+| Phase 8: 2000 reads, cache enabled | +2000 | +0 | `host_driver_linux_phase8.c` |
+| Phase 8: 2000 reads, `CACHE_BYPASS` enabled | +0 | +2000 | `host_driver_linux_phase8.c` |
+
+The 24-vs-16 result (misses genuinely dominating a working set larger than cache capacity)
+and the clean 2000/0 vs. 0/2000 split under bypass are both exactly what the RTL's control
+logic should produce if it's correct — and are asserted as exact deltas in the test code,
+not eyeballed.
+
+### Max-outstanding-request stress (Phase 7)
+
+All **16** possible tags (`NUM_TAGS`, `TAG_W=4`) fired without draining any of them, then
+drained together: **16/16** responses correctly routed, **zero** phantom completions
+(a response for a tag never fired), **zero** duplicates.
+
+### Phase 8: the cache-on-vs-off latency experiment (N=2000 accesses each)
+
+Measured with `clock_gettime(CLOCK_MONOTONIC)` — a real hardware timer (ARM generic timer
+via the VDSO), not a software counting loop:
+
+| | avg | min | max | stddev |
+|---|---|---|---|---|
+| Cache **ON** (hit) | 3236.3 ns | 3170.0 ns | 56470.0 ns | 1190.7 ns |
+| Cache **OFF** (`CACHE_BYPASS`) | 3233.9 ns | 3190.0 ns | 42580.0 ns | 880.2 ns |
+
+**Difference: -2.4 ns average** — smaller than the ~1035 ns pooled measurement noise, i.e.
+**not statistically significant**. This is the honest result, not a failed one: the cache's
+real RTL-level saving is `READ_EXTRA_LATENCY=3` cycles @ 50MHz = **60 ns**, dwarfed by the
+**~3.2 microsecond** fixed cost of a software-driven Avalon-MM round trip through mmap'd
+`/dev/mem` and the Lightweight HPS-to-FPGA bridge — a cost that applies identically to hits
+and misses, so it cannot distinguish them. See the Phase 8 section of
+`FPGA_Implementation_Roadmap.md` for the full methodology and reasoning.
 
 ---
 
